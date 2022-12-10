@@ -1,0 +1,55 @@
+rules_version = '2';
+service cloud.firestore {
+  function isCustomer() {
+    return request.auth.token.line == true;
+  }
+  function isCustomerUID(uid) {
+    return request.auth.uid == uid && isCustomer();
+  }
+  function isStaff() {
+    return request.auth.token.staff == true;
+  }
+  function isAdmin() {
+    return request.auth.token.admin == true;
+  }
+  function verifyCreateFields(required, optional) {
+    return request.resource.data.keys().hasAll(required) && request.resource.data.keys().hasOnly(required.concat(optional));
+  }
+  function allowUpdateFields(fields) {
+    return request.resource.data.diff(resource.data).affectedKeys().hasOnly(fields);
+  }
+  function allowUpdateFieldsWithIsEdit(fields) {
+    return request.resource.data.keys().hasAll(['is_edit']) && allowUpdateFields(fields.concat(['is_edit']));
+  }
+  match /databases/{database}/documents {
+    match /customers/{customer_uid} {
+      allow get: if isCustomerUID(customer_uid) || isStaff();
+      allow list: if isStaff();
+      match /cars/{license_number} {
+        allow read, delete: if isCustomerUID(customer_uid) || isStaff();
+        allow create: if (isCustomerUID(customer_uid) || isStaff()) && verifyCreateFields(['license_number', 'province', 'brand', 'color'], []);
+      }
+    }
+    match /staffs/{email} {
+      allow get: if isCustomer() || isStaff();
+      allow list: if isStaff();
+    }
+    match /cars/{license_number} {
+      allow get, list: if isAdmin();
+    }
+    match /transactions/{tid} {
+      allow get, list: if true;
+      allow create: if isStaff() && verifyCreateFields(['license_number', 'timestamp_in'], ['image_in', 'add_by']);
+      allow update: if isStaff() && allowUpdateFieldsWithIsEdit(['license_number', 'timestamp_in', 'timestamp_out', 'image_in', 'image_out', 'remark']);
+      match /payments/{pid} {
+        allow get, list: if true;
+        allow create: if verifyCreateFields(['amount', 'timestamp', 'slip'], ['paid_by']);
+        allow update: if isStaff() && allowUpdateFieldsWithIsEdit(['status']);
+      }
+    }
+    match /{document=**} {
+      allow read: if true;
+      allow write: if false;
+    }
+  }
+}

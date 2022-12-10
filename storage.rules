@@ -1,0 +1,35 @@
+rules_version = '2';
+service firebase.storage {
+  function isCustomer() {
+    return request.auth.token.line == true;
+  }
+  function isStaff() {
+    return request.auth.token.staff == true;
+  }
+  function isStaffEmail(email) {
+    return request.auth.token.email == email && isStaff();
+  }
+  function isAdmin() {
+    return request.auth.token.admin == true;
+  }
+  match /b/{bucket}/o {
+  	match /staffs/{email}/{allPaths=**} {
+    	allow get, list: if isStaff();
+    	allow create, update, delete: if isStaffEmail(email) || isAdmin();
+    }
+    match /transactions/{allPaths=**} {
+    	allow get: if isCustomer() || isStaff();
+      allow list: if isStaff();
+      allow create, update, delete: if isStaff();
+    }
+    match /payments/{tid}/{allPaths=**} {
+      allow get, create: if true;
+      allow list: if isStaff();
+      allow update, delete: if isAdmin(); 
+    }
+    match /{allPaths=**} {
+      allow read: if true;
+      allow write: if false;
+    }
+  }
+}

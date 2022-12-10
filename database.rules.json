@@ -1,0 +1,16 @@
+{
+  "rules": {
+    "entrance": {
+      ".read": true,
+      ".write": "auth.token.staff === true"
+    },
+    "exit": {
+      ".read": true,
+      ".write": "auth.token.staff === true"
+    },
+    "settings": {
+      ".read": true,
+      ".write": "auth.token.admin === true"
+    }
+  }
+}

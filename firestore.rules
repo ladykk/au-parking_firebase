@@ -43,7 +43,7 @@ service cloud.firestore {
       allow update: if isStaff() && allowUpdateFieldsWithIsEdit(['license_number', 'timestamp_in', 'timestamp_out', 'image_in', 'image_out', 'remark']);
       match /payments/{pid} {
         allow get, list: if true;
-        allow create: if verifyCreateFields(['amount', 'timestamp', 'slip'], ['paid_by']);
+        allow create: if false;
         allow update: if isStaff() && allowUpdateFieldsWithIsEdit(['status']);
       }
     }

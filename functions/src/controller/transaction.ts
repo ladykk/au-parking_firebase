@@ -9,9 +9,15 @@ import { Firestore, RTDatabase } from "../firebase";
 import moment = require("moment-timezone");
 import axios, { AxiosError } from "axios";
 import NodeCache = require("node-cache");
+import stripe from "stripe";
 
 // [Secret]
 const APP_SECRET = process.env.APP_SECRET as string;
+const STRIPE_SECRET = process.env.STRIPE_SECRET as string;
+const STRIPE_ENDPOINT_SECRET = process.env.STRIPE_ENDPOINT_SECRET as string;
+
+// [Stripe]
+const Stripe = new stripe(STRIPE_SECRET, { apiVersion: "2022-11-15" });
 
 // [Bot]
 const BOT = axios.create({
@@ -32,7 +38,13 @@ BOT.interceptors.response.use(
 );
 
 // [Payment]
-type PaymentStatus = "Pending" | "Approve" | "Reject" | "Refund";
+type PaymentStatus =
+  | "Pending"
+  | "Success"
+  | "Failed"
+  | "Process"
+  | "Refund"
+  | "Canceled";
 
 type Payment = {
   [index: string]:
@@ -43,10 +55,11 @@ type Payment = {
     | boolean
     | undefined;
   pid: string;
+  client_secret: string;
   amount: number;
   timestamp: Timestamp;
   status: PaymentStatus;
-  slip: string;
+  reason?: string;
   paid_by?: DocumentReference<DocumentData>;
   is_edit?: boolean;
 };
@@ -384,6 +397,37 @@ exports.onTransactionsWrite = functions
           };
         }
 
+        // Update payment amount if there is pending payment.
+        if (old_transaction.fee !== transaction.fee) {
+          // Fetch pending payments.
+          const pending_payments_ref = await Firestore()
+            .collection("transactions")
+            .doc(tid)
+            .collection("payments")
+            .where("status", "==", "Pending")
+            .get();
+
+          // CASE: pending payments is more than 0.
+          if (pending_payments_ref.size > 0) {
+            const fee_diff_amount = transaction.fee - old_transaction.fee;
+            // CASE: add amount
+            // DO: update amount.
+            if (fee_diff_amount > 0 && transaction.fee > transaction.paid)
+              await Stripe.paymentIntents.update(
+                pending_payments_ref.docs[0].id,
+                {
+                  amount: (transaction.fee - transaction.paid) * 100,
+                }
+              );
+            // DO: cancel payment.
+            else
+              await Stripe.paymentIntents.cancel(
+                pending_payments_ref.docs[0].id,
+                { cancellation_reason: "abandoned" }
+              );
+          }
+        }
+
         // Check changed on notifications.
         const bot_action: string | null =
           transaction.status === "Cancel"
@@ -453,7 +497,6 @@ exports.onTransactionsPaymentsWrite = functions
   .onWrite(async (changes, context) => {
     // Format parameters.
     const tid: string = context.params.tid;
-    const pid: string = context.params.pid;
     const old_payment: Payment | null = changes.before.exists
       ? (changes.before.data() as Payment)
       : null;
@@ -467,58 +510,26 @@ exports.onTransactionsPaymentsWrite = functions
         await transaction_ref.get()
       ).data() as Transaction;
 
-      // Payment - on create.
-      // DO: set pid, status. add to "pending_payments" and update paid and status.
-      if (!old_payment && new_payment) {
-        // Format payment.
-        const payment: Payment = {
-          ...new_payment,
-          status: "Pending",
-          pid: pid,
-        };
-
-        // Update transaction's paid and status.
-        const new_paid = transaction.paid + payment.amount;
-        await transaction_ref.update({
-          paid: new_paid,
-          status: transactionStatus(
-            transaction.fee,
-            new_paid,
-            transaction.is_cancel
-          ),
-        });
-
-        // Call bot to notify customer.
-        // CASE: have payer.
-        // DO: call bot.
-        if (payment.paid_by) {
-          await BOT({
-            url: "/payment/receive",
-            data: {
-              target: payment.paid_by.id,
-              amount: payment.amount,
-              timestamp: timestampToString(payment.timestamp),
-              pid: payment.pid,
-              tid: tid,
-            },
-          });
-        }
-
-        // Update Payment's Info
-        return changes.after.ref.set(payment);
-      }
-
       // CASE: already initialize.
       // DO: terminate database call.
       if (!old_payment?.pid && new_payment?.pid) return null;
+
+      // CASE: update client_secret.
+      // DO: terminate database call.
+      if (!old_payment?.client_secret && new_payment?.client_secret)
+        return null;
+
+      // CASE: Cancel payment.
+      // DO: terminate database call.
+      if (new_payment?.status === "Canceled") return null;
 
       // Payment - on update.
       // DO: Set "Status to Approve, Reject, or Refunded"
       /*
         Allow Status Change:
-          Pending -> Approve
-          Pending -> Reject
-          Pending -> Refund
+          Pending -> Success
+          Pending -> Failed
+          Pending -> Canceled
           Approve -> Refund
       */
       if (old_payment && new_payment) {
@@ -527,24 +538,33 @@ exports.onTransactionsPaymentsWrite = functions
         if (!(!old_payment.is_edit && new_payment.is_edit)) return null;
 
         // Format changes.
-        const pending_approve =
-          old_payment.status === "Pending" && new_payment.status === "Approve";
-        const pending_reject =
-          old_payment.status === "Pending" && new_payment.status === "Reject";
-        const pending_refund =
-          old_payment.status === "Pending" && new_payment.status === "Refund";
-        const approve_refund =
-          old_payment.status === "Approve" && new_payment.status === "Refund";
+        const pending_success =
+          old_payment.status === "Pending" && new_payment.status === "Success";
+        const pending_failed =
+          old_payment.status === "Pending" && new_payment.status === "Failed";
+        const pending_process =
+          old_payment.status === "Pending" && new_payment.status === "Process";
+        const process_success =
+          old_payment.status === "Process" && new_payment.status === "Success";
+        const process_failed =
+          old_payment.status === "Process" && new_payment.status === "Failed";
+        const success_refund =
+          old_payment.status === "Success" && new_payment.status === "Refund";
         const allow_change =
-          pending_approve || pending_reject || pending_refund || approve_refund;
+          pending_success ||
+          pending_failed ||
+          pending_process ||
+          process_success ||
+          process_failed ||
+          success_refund;
 
         // CASE: no allow changes.
         // DO: reverse changes.
         if (!allow_change)
           return changes.before.ref.set(changes.before.data() as any);
 
-        // CASE: Deduct paid. (Pending -> Reject, Pending -> Refund, Approve -> Refund)
-        if (!pending_approve) {
+        // CASE: Refund.
+        if (success_refund) {
           // Set transaction.
           const new_paid =
             transaction.paid > 0 ? transaction.paid - old_payment.amount : 0;
@@ -558,16 +578,36 @@ exports.onTransactionsPaymentsWrite = functions
           });
         }
 
+        // CASE: Success
+        if (pending_success || process_success) {
+          const new_paid = transaction.paid + old_payment.amount;
+          await transaction_ref.update({
+            paid: new_paid,
+            status: transactionStatus(
+              transaction.fee,
+              new_paid,
+              transaction.is_cancel
+            ),
+          });
+        }
+
         // Call bot to notify customer.
-        // CASE: have payer and not change to pending and approve.
+        // CASE: have payer and change to "Success" | "Failed" | "Refund"
         // DO: call bot.
         if (
           new_payment.paid_by &&
-          new_payment.status !== "Approve" &&
-          new_payment.status !== "Pending"
+          (new_payment.status === "Success" ||
+            new_payment.status === "Failed" ||
+            new_payment.status === "Refund")
         ) {
           await BOT({
-            url: `/payment/${new_payment.status.toLowerCase()}`,
+            url: `/payment/${
+              new_payment.status === "Success"
+                ? "receive"
+                : new_payment.status === "Failed"
+                ? "reject"
+                : "refund"
+            }`,
             data: {
               target: new_payment.paid_by.id,
               amount: new_payment.amount,
@@ -581,6 +621,7 @@ exports.onTransactionsPaymentsWrite = functions
         // Set status then remove is_edit.
         return changes.after.ref.update({
           status: new_payment.status,
+          reason: new_payment.reason,
           is_edit: FieldValue.delete(),
         });
       }
@@ -691,6 +732,7 @@ exports.reCalculateInSystemTransactionFee = functions
     );
   });
 
+// F - On Fee Write
 exports.onFeeWrtie = functions
   .region("asia-southeast2")
   .runWith({ timeoutSeconds: 300 })
@@ -701,4 +743,175 @@ exports.onFeeWrtie = functions
     if (snapshot.after.exists() && typeof snapshot.after.val() === "number") {
       cache.set<number>("FEE_PER_DAY", snapshot.after.val(), 3600);
     }
+  });
+
+// F - Create Payment
+exports.createPayment = functions
+  .region("asia-southeast2")
+  .runWith({ timeoutSeconds: 300 })
+  .https.onCall(async (tid: string, context) => {
+    // CASE: no tid.
+    // DO: throw invalid-argument.
+    if (!tid)
+      throw new functions.https.HttpsError("invalid-argument", "no tid.");
+
+    // Fetch transaction.
+    const t_ref = Firestore().collection("transactions").doc(tid);
+    const transaction = (await t_ref.get()).data() as Transaction | null;
+
+    // CASE: no transaction.
+    // DO: throw invalid-argument.
+    if (!transaction)
+      throw new functions.https.HttpsError("invalid-argument", "invalid tid.");
+
+    // CASE: transaction is paid.
+    // DO: throw invalid-argument.
+    if (transaction.status === "Paid")
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "transaction is paid."
+      );
+
+    // Fetch pending payments in the transaction.
+    const transaaction_payments_ref = t_ref.collection("payments");
+    const pending_payments = await transaaction_payments_ref
+      .where("status", "==", "Pending")
+      .get();
+
+    // CASE: there are pending payments in transaction.
+    // DO: return the first payment intent.
+    if (pending_payments.size > 0) {
+      const payment = pending_payments.docs[0].data() as Payment;
+      return payment.pid;
+    }
+
+    // Create Payment Intent.
+    const paymentIntent = await Stripe.paymentIntents.create({
+      amount: (transaction.fee - transaction.paid) * 100,
+      currency: "thb",
+      payment_method_types: ["promptpay"],
+      description: `Parking fee of ${transaction.license_number} on ${moment(
+        transaction.timestamp_in
+      )
+        .tz("Asia/Bangkok")
+        .format("DD/MM/YYYY HH:mm:ss")}.`,
+      metadata: {
+        tid: transaction.tid,
+      },
+    });
+
+    // Create payment.
+    const payment_ref = transaaction_payments_ref.doc(paymentIntent.id);
+    await payment_ref.set({
+      amount: transaction.fee - transaction.paid,
+      timestamp: FieldValue.serverTimestamp(),
+      pid: paymentIntent.id,
+      status: "Pending",
+      client_secret: paymentIntent.client_secret,
+      paid_by: context.auth?.token.line
+        ? Firestore().collection("customers").doc(context.auth.uid)
+        : undefined,
+    });
+
+    return payment_ref.id;
+  });
+
+exports.webhook = functions
+  .region("asia-southeast2")
+  .runWith({ timeoutSeconds: 300 })
+  .https.onRequest(async (req, res) => {
+    // CASE: method is not "POST".
+    // DO: throw not found.
+    if (req.method !== "POST") {
+      res.sendStatus(404);
+      return;
+    }
+
+    let event = req.body as stripe.Event;
+    // Verify endpoint secret.
+    if (STRIPE_ENDPOINT_SECRET) {
+      // Get signature.
+      const signature = req.headers["stripe-signature"];
+      try {
+        if (!signature) throw new Error();
+        event = Stripe.webhooks.constructEvent(
+          req.rawBody,
+          signature,
+          STRIPE_ENDPOINT_SECRET
+        );
+      } catch (err) {
+        console.log("Cannot verify webhook signature.");
+        res.sendStatus(400);
+        return;
+      }
+    }
+
+    const object = event.data.object as stripe.PaymentIntent;
+    const tid = object.metadata.tid;
+    const pid = object.id;
+    // Handle event.
+    switch (event.type) {
+      case "payment_intent.succeeded":
+        // Update payment success.
+        if (tid && pid) {
+          await Firestore()
+            .collection("transactions")
+            .doc(tid)
+            .collection("payments")
+            .doc(pid)
+            .update({ status: "Success", is_edit: true });
+        } else {
+          console.log(`Cannot extract tid or pid. (${event.type})`);
+        }
+        break;
+      case "payment_intent.processing":
+        // Update payment success.
+        if (tid && pid) {
+          await Firestore()
+            .collection("transactions")
+            .doc(tid)
+            .collection("payments")
+            .doc(pid)
+            .update({ status: "Process", is_edit: true });
+        } else {
+          console.log(`Cannot extract tid or pid. (${event.type})`);
+        }
+        break;
+      case "payment_intent.canceled":
+        if (tid && pid) {
+          await Firestore()
+            .collection("transactions")
+            .doc(tid)
+            .collection("payments")
+            .doc(pid)
+            .update({
+              status: "Canceled",
+              reason: object.cancellation_reason,
+            });
+        } else {
+          console.log(`Cannot extract tid or pid. (${event.type})`);
+        }
+        break;
+      case "payment_intent.payment_failed":
+        // Update payment success.
+        if (tid && pid) {
+          await Firestore()
+            .collection("transactions")
+            .doc(tid)
+            .collection("payments")
+            .doc(pid)
+            .update({
+              status: "Failed",
+              reason: object.last_payment_error?.code,
+              is_edit: true,
+            });
+        } else {
+          console.log(`Cannot extract tid or pid. (${event.type})`);
+        }
+        break;
+      default:
+    }
+
+    // Return 200.
+    res.send();
   });

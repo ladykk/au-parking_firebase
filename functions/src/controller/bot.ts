@@ -4,35 +4,39 @@ import { NextFunction, Request, Response } from "express";
 import express = require("express");
 import cors = require("cors");
 import NodeCache = require("node-cache");
-import { Firestore } from "../firebase";
+import { Firestore } from "../";
 import { DocumentData, DocumentReference } from "firebase-admin/firestore";
 import { Message } from "@line/bot-sdk";
 
-// [Secret]
-const APP_SECRET = process.env.APP_SECRET;
-
-// [LIFF]
-const LIFF_URI = process.env.LIFF_URI;
-
-// [Messaging API]
-const MESSAGING_API_CONFIG = {
-  channelAccessToken:
-    "OTRkdQJglg6b9kk7Xm9xzgI2yXahjGG4cRMAgqU/tk8GWKmxP6fx760tIMSihsPjZOAmYaM9ygT67qxIIntkbTA/IJYFcR/t7yR2Xb5Bl5Wj0I34o5V8AadGsD8JdXnWHQ1BBqnFrKmldxPEYAIUcgdB04t89/1O/w1cDnyilFU=",
-  channelSecret: process.env.LINE_MESSAGING_API_CHANNEL_SECRET,
-};
-// @ts-ignore
-const LINE = new line.Client(MESSAGING_API_CONFIG);
-
-// [Cars]
+// [Type/Function]
 type CarCustomers = {
   license_number: string;
   owners: Array<DocumentReference<DocumentData>>;
 };
+const getCar = async (license_number: string) => {
+  // Get car from catch.
+  let car = cars.get<CarCustomers | null>(license_number);
 
-// [Caches]
-const cars = new NodeCache({ stdTTL: 1800, useClones: false }); // TTL - 30 minutes.
+  // CASE: Car exists in cache.
+  // DO: return car.
+  if (typeof car !== "undefined") return car;
 
-// [Template]
+  // Fetch car from database.
+  const car_ref = await Firestore()
+    .collection("cars")
+    .doc(license_number)
+    .get();
+  car = car_ref.exists ? (car_ref.data() as CarCustomers) : null;
+
+  // Update cache.
+  cars.set<CarCustomers | null>(license_number, car);
+
+  // Return car
+  return car;
+};
+const extractUID = (input: string) => input.slice(5);
+const extractUIDs = (inputs: Array<string>) =>
+  inputs.map((uid) => uid.slice(5));
 const Template = {
   welcomeMessage: (displayName: string): Message => ({
     type: "flex",
@@ -723,80 +727,84 @@ const Template = {
   }),
 };
 
-// [Express]
+// > Initializes modules.
+const APP_SECRET = process.env.APP_SECRET;
+const LIFF_URI = process.env.LIFF_URI;
+const MESSAGING_API_CONFIG: line.ClientConfig = {
+  channelAccessToken:
+    "OTRkdQJglg6b9kk7Xm9xzgI2yXahjGG4cRMAgqU/tk8GWKmxP6fx760tIMSihsPjZOAmYaM9ygT67qxIIntkbTA/IJYFcR/t7yR2Xb5Bl5Wj0I34o5V8AadGsD8JdXnWHQ1BBqnFrKmldxPEYAIUcgdB04t89/1O/w1cDnyilFU=",
+  channelSecret: process.env.LINE_MESSAGING_API_CHANNEL_SECRET,
+};
+const LINE = new line.Client(MESSAGING_API_CONFIG);
+const cars = new NodeCache({ stdTTL: 1800, useClones: false }); // TTL - 30 minutes.
 const bot = express();
 bot.use(cors({ origin: true }));
 
-// [Middlewares]
-// M - Check app secret.
+// [BOT API]
+// > Check APP_SECRET. (Middleware)
 const checkAppSecret = async (
   req: Request,
   res: Response,
   next: NextFunction
 ) => {
+  // CASE: APP_SECRET matches.
+  // DO: allow request.
   if (req.get("SECRET") === APP_SECRET) return next();
+  // DO: reject request.
   else
     return next(
       new functions.https.HttpsError("permission-denied", "invalid credential.")
     );
 };
 
-// M - JSON parser
+// > Convert request's body to JSON. (Middleware)
 bot.use(express.json());
 
-const extractUID = (input: string) => input.slice(5);
-const extractUIDs = (inputs: Array<string>) =>
-  inputs.map((uid) => uid.slice(5));
-
-// M - UID extract.
+// > Extract UID/UIDs. (Middleware)
 bot.use((req: Request, res: Response, next: NextFunction) => {
-  // Extract on target.
   if (req.body.target) req.body.target = extractUID(req.body.target as string);
-  // Extract on targets.
   if (req.body.targets)
     req.body.targets = extractUIDs(req.body.targets as Array<string>);
 
   next();
 });
 
-// [Functions]
-// -> Cars
-// F - Push car notification.
+// > Push car notification. (Endpoint)
 bot.post("/car/:type", checkAppSecret, async (req: Request, res: Response) => {
-  // Check type
   // CASE: invalid types.
   // DO: return not found.
   const { type } = req.params;
-  if (!["add", "remove"].includes(type)) {
+  if (!["add", "remove"].includes(type))
     throw new functions.https.HttpsError("not-found", "");
-  }
 
-  // Check required fields.
   // CASE: missing some fields.
   // DO: return invalid-arguments.
-  if (!req.body.target || !req.body.license_number || !req.body.province) {
+  if (!req.body.target || !req.body.license_number || !req.body.province)
     throw new functions.https.HttpsError(
       "invalid-argument",
       "missing required fields."
     );
-  }
-  // Format data
+
+  // Format request's body.
   const target = req.body.target as string;
   const userId = `line:${target}`;
   const license_number = req.body.license_number as string;
-  const data = {
+  const payload = {
     license_number: license_number,
     province: req.body.province as string,
   };
 
-  // Push to customer.
-  await LINE.pushMessage(target, Template.carNotification(type, data));
+  // Push notification to customer.
+  await LINE.pushMessage(target, Template.carNotification(type, payload));
 
-  // Record in cache.
+  // Update cache.
   let car = cars.get<CarCustomers | null>(license_number) ?? null;
   switch (type) {
     case "add":
+      // CASE: license_number exists.
+      // DO: append owners to the license number.
       if (car) car.owners.push(Firestore().collection("customers").doc(userId));
+      // DO: crate new cache.
       else
         car = {
           license_number: license_number,
@@ -804,24 +812,26 @@ bot.post("/car/:type", checkAppSecret, async (req: Request, res: Response) => {
         };
       break;
     case "remove":
+      // CASE: license_number exists and owners more than 1.
+      // DO: remove onwer from the license_number.
       if (car && car.owners.length > 1)
         car.owners = car.owners.filter((owner) => owner.id !== userId);
+      // DO: remove the cache.
       else if (car && car.owners.length == 1) car = null;
     default:
       break;
   }
   cars.set<CarCustomers | null>(license_number, car);
 
+  // Response OK.
   return res.status(200).send("OK");
 });
 
-// -> Transactions
-// F - Push transaction notification.
+// > Push transaction notification. (Endpoint)
 bot.post(
   "/transaction/:type",
   checkAppSecret,
   async (req: Request, res: Response) => {
-    // Check type
     // CASE: invalid types.
     // DO: return not found.
     const { type } = req.params;
@@ -834,102 +844,93 @@ bot.post(
         "update",
         "warning",
       ].includes(type)
-    ) {
+    )
       throw new functions.https.HttpsError("not-found", "");
-    }
 
     // CASE: warning in-system transactions.
     if (type === "warning") {
       // CASE: missing targets.
       // DO: return invalid-arguments.
-      if (!req.body.targets) {
+      if (!req.body.targets)
         throw new functions.https.HttpsError(
           "invalid-argument",
           "missing targets."
         );
-      }
+
+      // Format request's body.
       const targets = req.body.targets as Array<string>;
+
+      // Push notification to customers.
       targets.forEach(async (target) => {
         await LINE.pushMessage(target, Template.warningInSystemTransactions());
       });
 
+      // Return OK.
       return res.status(200).send("OK.");
     }
 
-    // Check required fields.
     // CASE: missing some fields.
     // DO: return invalid-arguments.
-    if (!req.body.tid || !req.body.timestamp_in || !req.body.fee) {
+    if (!req.body.tid || !req.body.timestamp_in || !req.body.fee)
       throw new functions.https.HttpsError(
         "invalid-argument",
         "missing required fields."
       );
-    }
 
-    // Check required fields on "exit"
-    // CASE: missing some fields.
+    // CASE: missing some fields on "exit".
     // DO: return invalid-arguments.
-    if (type === "exit" && !req.body.timestamp_out) {
+    if (type === "exit" && !req.body.timestamp_out)
       throw new functions.https.HttpsError(
         "invalid-argument",
         "missing required fields."
       );
-    }
 
-    // Format data.
+    // Format request's body.
     const license_number = req.body.license_number as string;
-    if (!cars.has(license_number)) {
-      const car_ref = await Firestore()
-        .collection("cars")
-        .doc(license_number)
-        .get();
-      const data = car_ref.exists ? (car_ref.data() as CarCustomers) : null;
-      cars.set<CarCustomers | null>(license_number, data);
-    }
-    const car = cars.get<CarCustomers | null>(license_number) ?? null;
+
+    // Fetch car.
+    const car = await getCar(license_number);
+
+    // CASE: No car.
+    // DO: return OK.
     if (!car) return res.status(200).send("OK.");
 
-    // Multicast to customers.
-    // CASE: has onwer.
-    // DO: call multicast.
-    if (car.owners.length > 0) {
-      const data = {
-        tid: req.body.tid as string,
-        license_number: license_number,
-        timestamp_in: req.body.timestamp_in as string,
-        timestamp_out: req.body.timestamp_out as string | undefined,
-        fee: req.body.fee as number,
-        image_in: req.body.image_in as string | undefined,
-        image_out: req.body.image_out as string | undefined,
-      };
-      car.owners.forEach(async (target) => {
+    // Format payload.
+    const payload = {
+      tid: req.body.tid as string,
+      license_number: license_number,
+      timestamp_in: req.body.timestamp_in as string,
+      timestamp_out: req.body.timestamp_out as string | undefined,
+      fee: req.body.fee as number,
+      image_in: req.body.image_in as string | undefined,
+      image_out: req.body.image_out as string | undefined,
+    };
+
+    // Push notification to customers.
+    car.owners.forEach(
+      async (target) =>
         await LINE.pushMessage(
           extractUID(target.id),
-          Template.transactionNotification(type, data)
-        );
-      });
-    }
+          Template.transactionNotification(type, payload)
+        )
+    );
 
-    // Return
+    // Return OK.
     return res.status(200).send("OK.");
   }
 );
 
-// -> Payments
-// F - Push payment notification.
+// > Push payment notification. (Endpoint)
 bot.post(
   "/payment/:type",
   checkAppSecret,
   async (req: Request, res: Response) => {
-    // Check type
     // CASE: invalid types.
     // DO: return not found.
     const { type } = req.params;
-    if (!["receive", "reject", "refund"].includes(type)) {
+    if (!["receive", "reject", "refund"].includes(type))
       throw new functions.https.HttpsError("not-found", "");
-    }
 
-    // Check required fields.
     // CASE: missing required fields.
     // DO: retrun invalid-arguments
     if (
@@ -938,31 +939,30 @@ bot.post(
       !req.body.timestamp ||
       !req.body.pid ||
       !req.body.tid
-    ) {
+    )
       throw new functions.https.HttpsError(
         "invalid-argument",
         "missing required fields."
       );
-    }
 
-    // Format data.
+    // Format request's body.
     const target = req.body.target as string;
-    const data = {
+    const payload = {
       amount: req.body.amount as number,
       timestamp: req.body.timestamp as string,
       pid: req.body.pid as string,
       tid: req.body.tid as string,
     };
 
-    // Push to customer.
-    LINE.pushMessage(target, Template.paymentNotification(type, data));
+    // Push notification to customer.
+    LINE.pushMessage(target, Template.paymentNotification(type, payload));
 
-    // Return
+    // Return OK.
     return res.status(200).send("OK.");
   }
 );
 
-// [Error handler]
+// > Handling Error.
 bot.use((err: any, req: Request, res: Response, next: NextFunction) => {
   if (typeof err === "undefined") {
     if (!res.headersSent) res.status(200).send("done.");

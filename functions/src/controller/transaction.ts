@@ -5,39 +5,13 @@ import {
   DocumentData,
   FieldValue,
 } from "@google-cloud/firestore";
-import { Firestore, RTDatabase } from "../firebase";
+import { Firestore, RTDatabase } from "../";
 import moment = require("moment-timezone");
 import axios, { AxiosError } from "axios";
 import NodeCache = require("node-cache");
 import stripe from "stripe";
 
-// [Secret]
-const APP_SECRET = process.env.APP_SECRET as string;
-const STRIPE_SECRET = process.env.STRIPE_SECRET as string;
-const STRIPE_ENDPOINT_SECRET = process.env.STRIPE_ENDPOINT_SECRET as string;
-
-// [Stripe]
-const Stripe = new stripe(STRIPE_SECRET, { apiVersion: "2022-11-15" });
-
-// [Bot]
-const BOT = axios.create({
-  baseURL: "https://asia-southeast2-au-parking.cloudfunctions.net/bot",
-  method: "POST",
-  headers: {
-    "Content-Type": "application/json",
-    SECRET: APP_SECRET,
-  },
-});
-BOT.interceptors.response.use(
-  (response) => response,
-  (err) => {
-    if (err instanceof AxiosError)
-      console.error(`response error: ${err.response?.data}.`);
-    else console.error(`cannot send api.`);
-  }
-);
-
-// [Payment]
+// [Type/Function]
 type PaymentStatus =
   | "Pending"
   | "Success"
@@ -45,7 +19,6 @@ type PaymentStatus =
   | "Process"
   | "Refund"
   | "Canceled";
-
 type Payment = {
   [index: string]:
     | string
@@ -61,12 +34,8 @@ type Payment = {
   status: PaymentStatus;
   reason?: string;
   paid_by?: DocumentReference<DocumentData>;
-  is_edit?: boolean;
 };
-
-// [Transaction]
 type TransactionStatus = "Unpaid" | "Paid" | "Cancel";
-
 type Transaction = {
   [index: string]:
     | string
@@ -92,16 +61,10 @@ type Transaction = {
   is_edit?: boolean;
   has_image?: boolean;
 };
-
-// [Cars]
 type CarCustomers = {
   license_number: string;
   owners: Array<DocumentReference<DocumentData>>;
 };
-
-// [Caches]
-const cache = new NodeCache({ useClones: false });
-
 const calculateFee = async (
   time_in: Timestamp,
   time_out: Timestamp | null
@@ -161,8 +124,30 @@ const timestampToString = (input: Timestamp) => {
     .format("DD/MM/YYYY HH:mm:ss");
 };
 
-// [Function]
-// F - Event on "transactions" being write.
+// > Initializes modules.
+const APP_SECRET = process.env.APP_SECRET as string;
+const STRIPE_SECRET = process.env.STRIPE_SECRET as string;
+const STRIPE_ENDPOINT_SECRET = process.env.STRIPE_ENDPOINT_SECRET as string;
+const Stripe = new stripe(STRIPE_SECRET, { apiVersion: "2022-11-15" });
+const BOT = axios.create({
+  baseURL: "https://asia-southeast2-au-parking.cloudfunctions.net/bot",
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    SECRET: APP_SECRET,
+  },
+});
+BOT.interceptors.response.use(
+  (response) => response,
+  (err) => {
+    if (err instanceof AxiosError)
+      console.error(`response error: ${err.response?.data}.`);
+    else console.error(`cannot send api.`);
+  }
+);
+const cache = new NodeCache({ useClones: false });
+
+// > Transactions write. (Firestore.wrtie)
 exports.onTransactionsWrite = functions
   .region("asia-southeast2")
   .runWith({ timeoutSeconds: 300 })
@@ -177,7 +162,7 @@ exports.onTransactionsWrite = functions
       ? (changes.after.data() as Transaction)
       : null;
     try {
-      // Transaction - on create.
+      // CASE: on create.
       // DO: add tid, status, fee, paid.
       if (!old_transaction && new_transaction) {
         // Format new transaction.
@@ -213,7 +198,7 @@ exports.onTransactionsWrite = functions
       // DO: terminate database call.
       if (!old_transaction?.tid && new_transaction?.tid) return null;
 
-      // Transaction - on update.
+      // CASE: on update.
       // DO: change transaction's data.
       /*
         Allow Changes:
@@ -412,13 +397,17 @@ exports.onTransactionsWrite = functions
             const fee_diff_amount = transaction.fee - old_transaction.fee;
             // CASE: add amount
             // DO: update amount.
-            if (fee_diff_amount > 0 && transaction.fee > transaction.paid)
+            if (fee_diff_amount > 0 && transaction.fee > transaction.paid) {
               await Stripe.paymentIntents.update(
                 pending_payments_ref.docs[0].id,
                 {
                   amount: (transaction.fee - transaction.paid) * 100,
                 }
               );
+              await pending_payments_ref.docs[0].ref.update({
+                amount: transaction.fee - transaction.paid,
+              });
+            }
             // DO: cancel payment.
             else
               await Stripe.paymentIntents.cancel(
@@ -476,7 +465,7 @@ exports.onTransactionsWrite = functions
         );
       }
 
-      // Transaction - on delete.
+      // CASE: on delete.
       // DO: no change,
       return null;
     } catch (e) {
@@ -489,12 +478,12 @@ exports.onTransactionsWrite = functions
     }
   });
 
-// F - Event on "transactions/payments" being write.
+// > Payments update. (Firestore.onUpdate)
 exports.onTransactionsPaymentsWrite = functions
   .region("asia-southeast2")
   .runWith({ timeoutSeconds: 300 })
   .firestore.document("/transactions/{tid}/payments/{pid}")
-  .onWrite(async (changes, context) => {
+  .onUpdate(async (changes, context) => {
     // Format parameters.
     const tid: string = context.params.tid;
     const old_payment: Payment | null = changes.before.exists
@@ -505,26 +494,18 @@ exports.onTransactionsPaymentsWrite = functions
       : null;
     const transaction_ref = Firestore().collection("transactions").doc(tid);
     try {
-      // Get transaction.
-      const transaction: Transaction = (
-        await transaction_ref.get()
-      ).data() as Transaction;
-
-      // CASE: already initialize.
-      // DO: terminate database call.
-      if (!old_payment?.pid && new_payment?.pid) return null;
-
-      // CASE: update client_secret.
-      // DO: terminate database call.
-      if (!old_payment?.client_secret && new_payment?.client_secret)
-        return null;
-
       // CASE: Cancel payment.
       // DO: terminate database call.
       if (new_payment?.status === "Canceled") return null;
 
-      // Payment - on update.
-      // DO: Set "Status to Approve, Reject, or Refunded"
+      // CASE: cannot retrive data.
+      // DO: terminate database call.
+      if (!old_payment || !new_payment) return null;
+
+      // CASE: fee changes.
+      // DO: terminate database call.
+      if (old_payment.fee !== new_payment.fee) return null;
+
       /*
         Allow Status Change:
           Pending -> Success
@@ -532,40 +513,43 @@ exports.onTransactionsPaymentsWrite = functions
           Pending -> Canceled
           Approve -> Refund
       */
-      if (old_payment && new_payment) {
-        // CASE: already update or not update user.
-        // DO: terminate database call.
-        if (!(!old_payment.is_edit && new_payment.is_edit)) return null;
 
-        // Format changes.
-        const pending_success =
-          old_payment.status === "Pending" && new_payment.status === "Success";
-        const pending_failed =
-          old_payment.status === "Pending" && new_payment.status === "Failed";
-        const pending_process =
-          old_payment.status === "Pending" && new_payment.status === "Process";
-        const process_success =
-          old_payment.status === "Process" && new_payment.status === "Success";
-        const process_failed =
-          old_payment.status === "Process" && new_payment.status === "Failed";
-        const success_refund =
-          old_payment.status === "Success" && new_payment.status === "Refund";
-        const allow_change =
-          pending_success ||
-          pending_failed ||
-          pending_process ||
-          process_success ||
-          process_failed ||
-          success_refund;
+      // Format changes.
+      const pending_success =
+        old_payment.status === "Pending" && new_payment.status === "Success";
+      const pending_failed =
+        old_payment.status === "Pending" && new_payment.status === "Failed";
+      const pending_process =
+        old_payment.status === "Pending" && new_payment.status === "Process";
+      const process_success =
+        old_payment.status === "Process" && new_payment.status === "Success";
+      const process_failed =
+        old_payment.status === "Process" && new_payment.status === "Failed";
+      const success_refund =
+        old_payment.status === "Success" && new_payment.status === "Refund";
+      const allow_change =
+        pending_success ||
+        pending_failed ||
+        pending_process ||
+        process_success ||
+        process_failed ||
+        success_refund;
 
-        // CASE: no allow changes.
-        // DO: reverse changes.
-        if (!allow_change)
-          return changes.before.ref.set(changes.before.data() as any);
+      // CASE: no allow changes.
+      // DO: reverse changes.
+      if (!allow_change)
+        return changes.before.ref.set(changes.before.data() as any);
+
+      // CASE: transaction update.
+      if (success_refund || pending_success || process_success) {
+        // Get transaction.
+        const transaction: Transaction = (
+          await transaction_ref.get()
+        ).data() as Transaction;
 
         // CASE: Refund.
+        // DO: deduct paid.
         if (success_refund) {
-          // Set transaction.
           const new_paid =
             transaction.paid > 0 ? transaction.paid - old_payment.amount : 0;
           await transaction_ref.update({
@@ -577,8 +561,8 @@ exports.onTransactionsPaymentsWrite = functions
             ),
           });
         }
-
         // CASE: Success
+        // CASE: add paid.
         if (pending_success || process_success) {
           const new_paid = transaction.paid + old_payment.amount;
           await transaction_ref.update({
@@ -590,51 +574,46 @@ exports.onTransactionsPaymentsWrite = functions
             ),
           });
         }
+      }
 
-        // Call bot to notify customer.
-        // CASE: have payer and change to "Success" | "Failed" | "Refund"
-        // DO: call bot.
-        if (
-          new_payment.paid_by &&
-          (new_payment.status === "Success" ||
-            new_payment.status === "Failed" ||
-            new_payment.status === "Refund")
-        ) {
-          await BOT({
-            url: `/payment/${
-              new_payment.status === "Success"
-                ? "receive"
-                : new_payment.status === "Failed"
-                ? "reject"
-                : "refund"
-            }`,
-            data: {
-              target: new_payment.paid_by.id,
-              amount: new_payment.amount,
-              timestamp: timestampToString(new_payment.timestamp),
-              pid: new_payment.pid,
-              tid: tid,
-            },
-          });
-        }
-
-        // Set status then remove is_edit.
-        return changes.after.ref.update({
-          status: new_payment.status,
-          reason: new_payment.reason,
-          is_edit: FieldValue.delete(),
+      // CASE: have payer and change to "Success" | "Failed" | "Refund"
+      // DO: call bot to notify customer.
+      if (
+        new_payment.paid_by &&
+        (new_payment.status === "Success" ||
+          new_payment.status === "Failed" ||
+          new_payment.status === "Refund")
+      ) {
+        await BOT({
+          url: `/payment/${
+            new_payment.status === "Success"
+              ? "receive"
+              : new_payment.status === "Failed"
+              ? "reject"
+              : "refund"
+          }`,
+          data: {
+            target: new_payment.paid_by.id,
+            amount: new_payment.amount,
+            timestamp: timestampToString(new_payment.timestamp),
+            pid: new_payment.pid,
+            tid: tid,
+          },
         });
       }
-      // Payment - on delete.
-      // DO: no change.
-      return null;
+
+      // Set status.
+      return changes.after.ref.update({
+        status: new_payment.status,
+        reason: new_payment.reason,
+      });
     } catch (e) {
       console.error(e);
       return null;
     }
   });
 
-// F - Warning in-system transaction.
+// > Warning in-system transactions. (Schedule)
 exports.warningInSystemTransaction = functions
   .region("asia-southeast2")
   .runWith({ timeoutSeconds: 300 })
@@ -645,6 +624,7 @@ exports.warningInSystemTransaction = functions
     const transaction_refs = await Firestore()
       .collection("transactions")
       .where("timestamp_out", "==", null)
+      .where("is_cancel", "==", null)
       .get();
     const transactions = transaction_refs.docs.map(
       (doc) => doc.data() as Transaction
@@ -688,6 +668,7 @@ exports.warningInSystemTransaction = functions
         },
       });
 
+    // Log to system.
     console.log(
       `Send warning notifications successfully. (${targets.size} target${
         targets.size > 1 ? "s" : ""
@@ -695,44 +676,41 @@ exports.warningInSystemTransaction = functions
     );
   });
 
-// F - Re-calculate in-system transaction's fee.
+// > Recalculate transaction's fee. (Schedule)
 exports.reCalculateInSystemTransactionFee = functions
   .region("asia-southeast2")
   .runWith({ timeoutSeconds: 300 })
   .pubsub.schedule("0 5 * * *")
   .timeZone("Asia/Bangkok")
   .onRun(async (context) => {
-    // Fetch all transactions
+    // Fetch in-system transactions.
     const transaction_refs = await Firestore()
       .collection("transactions")
       .where("timestamp_out", "==", null)
+      .where("is_cancel", "==", null)
       .get();
     const transactions = transaction_refs.docs.map(
       (doc) => doc.data() as Transaction
     );
 
     // Update overnight transactions.
-    let count = 0;
-    for (let transaction of transactions) {
-      // CASE: transaction already closed.
-      // DO: ignore transaction.
-      if (transaction.timestamp_out) continue;
+    transactions.forEach(
+      async (transaction) =>
+        await Firestore()
+          .collection("transactions")
+          .doc(transaction.tid)
+          .update({ is_overnight: true, is_edit: true })
+    );
 
-      await Firestore()
-        .collection("transactions")
-        .doc(transaction.tid)
-        .update({ is_overnight: true, is_edit: true });
-      count++;
-    }
-
+    // Log to system.
     console.log(
-      `Recalculate fee in-system transactions successfully. (${count} transaction${
-        count > 1 ? "s" : ""
-      })`
+      `Recalculate fee in-system transactions successfully. (${
+        transactions.length
+      } transaction${transactions.length > 1 ? "s" : ""})`
     );
   });
 
-// F - On Fee Write
+// > Fee updated. (RealtimeDatabase.onWrite)
 exports.onFeeWrtie = functions
   .region("asia-southeast2")
   .runWith({ timeoutSeconds: 300 })
@@ -745,7 +723,7 @@ exports.onFeeWrtie = functions
     }
   });
 
-// F - Create Payment
+// > Create payment (Function)
 exports.createPayment = functions
   .region("asia-southeast2")
   .runWith({ timeoutSeconds: 300 })
@@ -816,6 +794,7 @@ exports.createPayment = functions
     return payment_ref.id;
   });
 
+// Transaction's payments webhook. (Endpoint)
 exports.webhook = functions
   .region("asia-southeast2")
   .runWith({ timeoutSeconds: 300 })
@@ -840,45 +819,43 @@ exports.webhook = functions
           STRIPE_ENDPOINT_SECRET
         );
       } catch (err) {
+        // CASE: cannot contruct event or no signatue.
+        // DO: throw bad request.
         console.log("Cannot verify webhook signature.");
         res.sendStatus(400);
         return;
       }
     }
 
+    // Extract object and metadata.
     const object = event.data.object as stripe.PaymentIntent;
     const tid = object.metadata.tid;
     const pid = object.id;
-    // Handle event.
-    switch (event.type) {
-      case "payment_intent.succeeded":
-        // Update payment success.
-        if (tid && pid) {
+
+    // CASE: has tid and pid.
+    // DO: handle event.
+    if (tid && pid)
+      switch (event.type) {
+        case "payment_intent.succeeded":
+          // Change status to "Success".
           await Firestore()
             .collection("transactions")
             .doc(tid)
             .collection("payments")
             .doc(pid)
-            .update({ status: "Success", is_edit: true });
-        } else {
-          console.log(`Cannot extract tid or pid. (${event.type})`);
-        }
-        break;
-      case "payment_intent.processing":
-        // Update payment success.
-        if (tid && pid) {
+            .update({ status: "Success" });
+          break;
+        case "payment_intent.processing":
+          // Change status to "Process".
           await Firestore()
             .collection("transactions")
             .doc(tid)
             .collection("payments")
             .doc(pid)
-            .update({ status: "Process", is_edit: true });
-        } else {
-          console.log(`Cannot extract tid or pid. (${event.type})`);
-        }
-        break;
-      case "payment_intent.canceled":
-        if (tid && pid) {
+            .update({ status: "Process" });
+          break;
+        case "payment_intent.canceled":
+          // Change status to "Cancel".
           await Firestore()
             .collection("transactions")
             .doc(tid)
@@ -888,13 +865,9 @@ exports.webhook = functions
               status: "Canceled",
               reason: object.cancellation_reason,
             });
-        } else {
-          console.log(`Cannot extract tid or pid. (${event.type})`);
-        }
-        break;
-      case "payment_intent.payment_failed":
-        // Update payment success.
-        if (tid && pid) {
+          break;
+        case "payment_intent.payment_failed":
+          // Change status to "Failed".
           await Firestore()
             .collection("transactions")
             .doc(tid)
@@ -903,14 +876,11 @@ exports.webhook = functions
             .update({
               status: "Failed",
               reason: object.last_payment_error?.code,
-              is_edit: true,
             });
-        } else {
-          console.log(`Cannot extract tid or pid. (${event.type})`);
-        }
-        break;
-      default:
-    }
+          break;
+        default:
+      }
+    else console.log(`Cannot extract tid or pid. (${event.type})`);
 
     // Return 200.
     res.send();

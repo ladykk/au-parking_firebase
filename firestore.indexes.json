@@ -32,18 +32,13 @@
         { "fieldPath": "status", "order": "ASCENDING" },
         { "fieldPath": "timestamp_in", "order": "DESCENDING" }
       ]
-    }
-  ],
-  "fieldOverrides": [
+    },
     {
-      "collectionGroup": "chats",
-      "fieldPath": "messageId",
-      "indexes": [
-        { "queryScope": "COLLECTION", "order": "ASCENDING" },
-        { "queryScope": "COLLECTION", "order": "DESCENDING" },
-        { "queryScope": "COLLECTION", "arrayConfig": "CONTAINS" },
-        { "queryScope": "COLLECTION_GROUP", "order": "ASCENDING" },
-        { "queryScope": "COLLECTION_GROUP", "order": "DESCENDING" }
+      "collectionGroup": "transactions",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "timestamp_out", "order": "ASCENDING" },
+        { "fieldPath": "is_cancel", "order": "ASCENDING" }
       ]
     }
   ]

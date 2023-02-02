@@ -1,5 +1,5 @@
 import * as functions from "firebase-functions";
-import { Firestore } from "../firebase";
+import { Firestore } from "..";
 import {
   DocumentReference,
   DocumentData,
@@ -7,10 +7,22 @@ import {
 } from "@google-cloud/firestore";
 import axios, { AxiosError } from "axios";
 
-// [Secret]
-const APP_SECRET = process.env.APP_SECRET as string;
+// [Type/Function]
+type Car = {
+  [index: string]: string;
+  license_number: string;
+  province: string;
+  brand: string;
+  color: string;
+};
+type CarOwners = {
+  [index: string]: string | Array<DocumentReference<DocumentData>>;
+  license_number: string;
+  owners: Array<DocumentReference<DocumentData>>;
+};
 
-// [Bot]
+// > Initializes modules.
+const APP_SECRET = process.env.APP_SECRET as string;
 const BOT = axios.create({
   baseURL: "https://asia-southeast2-au-parking.cloudfunctions.net/bot",
   method: "POST",
@@ -28,22 +40,7 @@ BOT.interceptors.response.use(
   }
 );
 
-// [Car]
-type Car = {
-  [index: string]: string;
-  license_number: string;
-  province: string;
-  brand: string;
-  color: string;
-};
-
-type CarOwners = {
-  [index: string]: string | Array<DocumentReference<DocumentData>>;
-  license_number: string;
-  owners: Array<DocumentReference<DocumentData>>;
-};
-
-// F - Event on "customers/cars" being write.
+// > Customer's cars write. (Firestore.onWrite)
 exports.onCustomersCarsWrite = functions
   .region("asia-southeast2")
   .runWith({ timeoutSeconds: 300 })
@@ -61,24 +58,25 @@ exports.onCustomersCarsWrite = functions
     const car_owners_ref = Firestore().collection("cars").doc(license_number);
     const customer_ref = Firestore().collection("customers").doc(customer_uid);
     try {
-      // Get car_owners.
-      let car_owners = await car_owners_ref.get();
+      // Get car's owners.
+      let car_owners_get = await car_owners_ref.get();
+      let car_owners = car_owners_get.exists
+        ? (car_owners_get.data() as CarOwners)
+        : null;
 
-      // Customer's Car - on delete.
-      // DO: remove customer_ref from car_owners.
+      // CASE: on delete.
+      // DO: remove customer from car_owners.
       if (old_car && !new_car) {
-        if (car_owners.exists) {
-          const data = car_owners.data() as CarOwners;
-          // CASE: car_owners have more than one owner.
-          // DO: remove customer_ref from car_onwers.
-          if (data.owners.length > 1)
+        // CASE: has car's owners.
+        if (car_owners)
+          if (car_owners.owners.length > 1)
+            // CASE: car's owners have more than one owner.
+            // DO: remove customer from car's onwers.
             await car_owners_ref.update({
               owners: FieldValue.arrayRemove(customer_ref),
             });
-          // CASE: car_owners have one or zero owner.
-          // DO: remove car_owners.
+          // DO: remove car's owners.
           else await car_owners_ref.delete();
-        }
 
         // Call bot to notify customer.
         await BOT({
@@ -91,18 +89,17 @@ exports.onCustomersCarsWrite = functions
         });
       }
 
-      // Customer's Car - on create.
-      // DO: add customer_ref to car_owners.
+      // CASE: on create.
+      // DO: add customer to car's owners.
       if (!old_car && new_car) {
-        // CASE: car_owners not exist.
-        // DO: create car_owners with customer_ref.
-        if (!car_owners.exists)
+        // CASE: car's owners not exist.
+        // DO: create car's owners with customer.
+        if (!car_owners)
           await car_owners_ref.set({
             license_number: license_number,
             owners: [customer_ref],
           } as CarOwners);
-        // CASE: car_onwers exist.
-        // DO: add customer_ref to car_owners.
+        // DO: add customer to car's owners.
         else
           await car_owners_ref.update({
             owners: FieldValue.arrayUnion(customer_ref),

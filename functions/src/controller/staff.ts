@@ -1,13 +1,10 @@
 import * as functions from "firebase-functions";
-import { Auth, Firestore } from "../firebase";
+import { Auth, Firestore } from "..";
 import { WriteResult } from "@google-cloud/firestore";
 import { UserRecord } from "firebase-functions/v1/auth";
 
-// -> Staff functions
-
-// [Staff]
+// [Type/Function]
 type StaffRole = "Administrator" | "Staff";
-
 type Staff = {
   [index: string]: string | boolean | undefined;
   email: string;
@@ -18,18 +15,15 @@ type Staff = {
   disabled: boolean;
   add_by?: string;
 };
-
 type AddStaff = {
-  [index: string]: string | File | null | undefined;
+  [index: string]: string | null | undefined;
   email: string;
   password: string;
   role: StaffRole;
   displayName: string;
   phone_number: string;
   photoUrl?: string;
-  add_by?: string;
 };
-
 type EditStaff = {
   [index: string]: string | boolean | undefined;
   displayName?: string;
@@ -40,13 +34,11 @@ type EditStaff = {
   photoUrl?: string;
 };
 
-// [Functions]
-// F - Add staff.
+// > Add staff. (Function)
 exports.addStaff = functions
   .region("asia-southeast2")
   .runWith({ timeoutSeconds: 300 })
   .https.onCall(async (data, context) => {
-    // Check is admin.
     // CASE: user is not admin.
     // DO: reject.
     if (!context.auth?.token.admin) {
@@ -59,7 +51,6 @@ exports.addStaff = functions
     let user: UserRecord | undefined;
     let staff: WriteResult | undefined;
     try {
-      // Check required fields on use_secret
       // CASE: missing required fields.
       // DO: reject.
       if (
@@ -67,8 +58,7 @@ exports.addStaff = functions
         !data.email ||
         !data.phone_number ||
         !data.role ||
-        !data.password ||
-        !data.add_by
+        !data.password
       ) {
         throw new functions.https.HttpsError(
           "invalid-argument",
@@ -76,7 +66,7 @@ exports.addStaff = functions
         );
       }
 
-      //Format inputs
+      //Format paramters.
       const info: AddStaff = {
         displayName: data.displayName,
         email: data.email,
@@ -84,10 +74,8 @@ exports.addStaff = functions
         role: data.role,
         photoUrl: data.photoUrl,
         password: data.password,
-        add_by: data.add_by,
       };
 
-      // Check if email is used.
       // CASE: user found with email.
       // DO: reject.
       const is_email_exist =
@@ -101,8 +89,13 @@ exports.addStaff = functions
         );
       }
 
-      // Format user info
-      let user_info: any = {
+      // Format user info.
+      let user_info: {
+        email: string;
+        password: string;
+        displayName: string;
+        photoUrl?: string;
+      } = {
         email: info.email,
         password: info.password,
         displayName: info.displayName,
@@ -134,8 +127,8 @@ exports.addStaff = functions
         });
 
       // Add staff to database.
-      const add_by = info.add_by
-        ? Firestore().collection("staffs").doc(info.add_by)
+      const add_by = context.auth.token.email
+        ? Firestore().collection("staffs").doc(context.auth.token.email)
         : undefined;
       await Firestore()
         .collection("staffs")
@@ -167,7 +160,7 @@ exports.addStaff = functions
     }
   });
 
-// F - Edit staff.
+// > Edit staff. (Function)
 exports.editStaff = functions
   .region("asia-southeast2")
   .runWith({ timeoutSeconds: 300 })
@@ -177,7 +170,6 @@ exports.editStaff = functions
     let new_user: UserRecord | undefined;
     let new_staff: WriteResult | undefined;
     try {
-      // Check credential (Staff/Admin)
       // CASE: no allow credential.
       // DO: reject.
       if (!context.auth?.token.staff) {
@@ -187,7 +179,6 @@ exports.editStaff = functions
         );
       }
 
-      // Check target_email.
       // CASE: no target_email.
       // DO: reject.
       const target_email: string | undefined = data.target_email;
@@ -198,7 +189,6 @@ exports.editStaff = functions
         );
       }
 
-      // Check if staff change other info.
       // CASE: staff change other info.
       // DO: reject
       if (
@@ -229,13 +219,11 @@ exports.editStaff = functions
         }
       }
 
-      // Check there is changes.
       // CASE: no changes.
       // DO: return.
-      if (Object.keys(changes).length === 0) return;
+      if (Object.keys(changes).length === 0) return "OK.";
 
-      // Check restricted fields only Admin. (disabled, role)
-      // CASE: conflict permission.
+      // CASE: only admin fields are modified by staff.
       // DO: reject.
       if (!context.auth.token.admin && (changes.disabled || changes.role)) {
         throw new functions.https.HttpsError(
@@ -257,8 +245,6 @@ exports.editStaff = functions
         });
 
       // Change user's info.
-      // CASE: cannot change user's info.
-      // DO: reject.
       // -> displayName
       if (changes.displayName)
         new_user = await Auth()
@@ -281,7 +267,7 @@ exports.editStaff = functions
               "cannot change disable."
             );
           });
-      // -> disabled
+      // -> photoUrl
       if (changes.photoUrl)
         new_user = await Auth()
           .updateUser(old_user.uid, {

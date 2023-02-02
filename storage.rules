@@ -22,11 +22,6 @@ service firebase.storage {
       allow list: if isStaff();
       allow create, update, delete: if isStaff();
     }
-    match /payments/{tid}/{allPaths=**} {
-      allow get, create: if true;
-      allow list: if isStaff();
-      allow update, delete: if isAdmin(); 
-    }
     match /{allPaths=**} {
       allow read: if true;
       allow write: if false;

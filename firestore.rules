@@ -40,7 +40,7 @@ service cloud.firestore {
     match /transactions/{tid} {
       allow get, list: if true;
       allow create: if isStaff() && verifyCreateFields(['license_number', 'timestamp_in'], ['image_in', 'add_by']);
-      allow update: if isStaff() && allowUpdateFieldsWithIsEdit(['license_number', 'timestamp_in', 'timestamp_out', 'image_in', 'image_out', 'remark']);
+      allow update: if isStaff() && allowUpdateFieldsWithIsEdit(['license_number', 'timestamp_in', 'timestamp_out', 'image_in', 'image_out', 'remark', 'is_cancel']);
       match /payments/{pid} {
         allow get, list: if true;
         allow create: if false;

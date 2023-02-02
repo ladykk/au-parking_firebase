@@ -1,12 +1,33 @@
 import axios from "axios";
 import * as functions from "firebase-functions";
-import { Auth, Firestore } from "../firebase";
+import { Auth, Firestore } from "..";
 
-// -> Customer functions
+// [Type/Function]
+type LINEProfile = {
+  [index: string]: string | undefined;
+  userId: string;
+  displayName: string;
+  pictureUrl?: string;
+  statusMessage?: string;
+};
+type Customer = {
+  [index: string]: string | undefined;
+  uid: string;
+  displayName: string;
+  photoUrl?: string;
+};
+function isProfileChange(
+  user_profile: { displayName: string; photoUrl?: string },
+  LINE_profile: LINEProfile
+) {
+  return (
+    user_profile.displayName !== LINE_profile.displayName ||
+    user_profile.photoUrl !== LINE_profile.pictureUrl
+  );
+}
 
-// [LINE API]
+// > Initializes modules.
 const LINE_LOGIN_CHANNEL_ID = process.env.LINE_LOGIN_CHANNEL_ID;
-
 const LINE_API = {
   verifyToken: {
     method: "GET",
@@ -18,40 +39,14 @@ const LINE_API = {
   },
 };
 
-type LINEProfile = {
-  [index: string]: string | undefined;
-  userId: string;
-  displayName: string;
-  pictureUrl?: string;
-  statusMessage?: string;
-};
-
-// [Customer]
-type Customer = {
-  [index: string]: string | undefined;
-  uid: string;
-  displayName: string;
-  photoUrl?: string;
-};
-
-function isProfileChange(
-  user_profile: { displayName: string; photoUrl?: string },
-  LINE_profile: LINEProfile
-) {
-  return (
-    user_profile.displayName !== LINE_profile.displayName ||
-    user_profile.photoUrl !== LINE_profile.pictureUrl
-  );
-}
-
-// [Functions]
-// F - Sign in with LINE Provider.
+// > Sign in with LINE Provider. (Function)
 exports.signInWithLINEProvider = functions
   .region("asia-southeast2")
   .runWith({ timeoutSeconds: 300 })
   .https.onCall(async (data, context) => {
-    // Get LINE access token.
+    // Format parameters.
     const LINE_access_token: string = data;
+
     // CASE: no LINE access token.
     // DO: reject.
     if (!LINE_access_token)
@@ -74,14 +69,14 @@ exports.signInWithLINEProvider = functions
         "cannot verify token."
       );
     });
-    // CASE: token not from own channel.
+
+    // CASE: token not from our channel.
     // DO: reject.
-    if (LINE_verify_token.data.client_id !== LINE_LOGIN_CHANNEL_ID) {
+    if (LINE_verify_token.data.client_id !== LINE_LOGIN_CHANNEL_ID)
       throw new functions.https.HttpsError(
         "unauthenticated",
         "cannot verify token."
       );
-    }
 
     // Get profile from LINE API.
     const LINE_profile: LINEProfile = (
@@ -107,10 +102,11 @@ exports.signInWithLINEProvider = functions
     let user = await Auth()
       .getUser(uid)
       .catch(() => {});
+
     // CASE: user not found.
     // DO: create new user, set  add to database.
     if (!user)
-      // Create user.
+      // Create user on Authentication.
       user = await Auth()
         .createUser({
           uid: uid,
@@ -172,12 +168,14 @@ exports.signInWithLINEProvider = functions
         LINE_profile
       )
     )
+      // Update user on Authentication.
       user = await Auth()
         .updateUser(uid, {
           displayName: LINE_profile.displayName,
           photoURL: LINE_profile.pictureUrl,
         })
         .then(async (user) => {
+          // Update user on database.
           await Firestore()
             .collection("customers")
             .doc(uid)
